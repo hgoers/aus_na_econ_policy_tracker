@@ -96,6 +96,32 @@ CC_EMAIL=
 - Schedule weekday runs at 06:30 ET:
   - See `scripts/cron_example.txt` (timezone-aware scheduler preferred).
 
+## GitHub Actions automation (computer can be off)
+
+Workflow file: [`.github/workflows/daily-pipeline.yml`](/Users/harrietgoers/Documents/aus_na_econ_policy_tracker/.github/workflows/daily-pipeline.yml)
+
+- Runs daily (including weekends) at **06:00 America/New_York** (DST-safe via dual UTC cron + NY-time gate).
+- Supports manual trigger via `workflow_dispatch`.
+- Executes live pipeline run and uploads `logs/` + `briefs/` artifacts.
+
+Required repository secrets:
+- `ANTHROPIC_API_KEY_POLICY_TRACKER`
+- `RECIPIENT_EMAIL`
+- `GMAIL_CREDENTIALS_JSON_B64` (base64 of `gmail_credentials.json`)
+- `GMAIL_TOKEN_JSON_B64` (base64 of `gmail_token.json`)
+
+Optional repository secrets:
+- `CC_EMAIL`
+- `GMAIL_SENDER`
+- `EMAIL_FROM`
+
+Create base64 secrets locally:
+
+```bash
+base64 -i .secrets/gmail_credentials.json | pbcopy
+base64 -i .secrets/gmail_token.json | pbcopy
+```
+
 ## Notes
 
 - Email recipient is enforced from `.env` (`RECIPIENT_EMAIL`), not model-provided `to`.
