@@ -1,0 +1,88 @@
+name: Daily Economic Intelligence Pipeline
+
+on:
+  workflow_dispatch:
+  schedule:
+    # 06:00 America/New_York daily (including weekends), with DST handling:
+    # - 10:00 UTC covers EDT
+    # - 11:00 UTC covers EST
+    - cron: '0 10 * * *'
+    - cron: '0 11 * * *'
+
+jobs:
+  run-pipeline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Gate to 06:00 New York time
+        id: ny_gate
+        shell: bash
+        run: |
+          NY_HOUR=$(TZ=America/New_York date +%H)
+          NY_MIN=$(TZ=America/New_York date +%M)
+          if [[ "$NY_HOUR" == "06" && "$NY_MIN" == "00" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "NY time: $(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')"
+
+      - name: Set up Python
+        if: steps.ny_gate.outputs.run == 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        if: steps.ny_gate.outputs.run == 'true'
+        run: pip install -r requirements.txt
+
+      - name: Materialize credentials and env
+        if: steps.ny_gate.outputs.run == 'true'
+        shell: bash
+        env:
+          ANTHROPIC_API_KEY_POLICY_TRACKER: ${{ secrets.ANTHROPIC_API_KEY_POLICY_TRACKER }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          CC_EMAIL: ${{ secrets.CC_EMAIL }}
+          GMAIL_CREDENTIALS_JSON_B64: ${{ secrets.GMAIL_CREDENTIALS_JSON_B64 }}
+          GMAIL_TOKEN_JSON_B64: ${{ secrets.GMAIL_TOKEN_JSON_B64 }}
+          GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+        run: |
+          mkdir -p .secrets
+
+          if [[ -n "${GMAIL_CREDENTIALS_JSON_B64}" ]]; then
+            echo "$GMAIL_CREDENTIALS_JSON_B64" | base64 -d > .secrets/gmail_credentials.json
+          fi
+          if [[ -n "${GMAIL_TOKEN_JSON_B64}" ]]; then
+            echo "$GMAIL_TOKEN_JSON_B64" | base64 -d > .secrets/gmail_token.json
+          fi
+
+          {
+            echo "ANTHROPIC_API_KEY_POLICY_TRACKER=${ANTHROPIC_API_KEY_POLICY_TRACKER}"
+            echo "RECIPIENT_EMAIL=${RECIPIENT_EMAIL}"
+            echo "GMAIL_CREDENTIALS_FILE=.secrets/gmail_credentials.json"
+            echo "GMAIL_TOKEN_FILE=.secrets/gmail_token.json"
+            echo "GMAIL_SENDER=${GMAIL_SENDER}"
+            echo "EMAIL_FROM=${EMAIL_FROM}"
+            echo "CC_EMAIL=${CC_EMAIL}"
+          } > .env
+
+      - name: Run pipeline (live send)
+        if: steps.ny_gate.outputs.run == 'true'
+        run: ./scripts/run_pipeline.sh
+
+      - name: Upload logs and briefs artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-artifacts-${{ github.run_id }}
+          path: |
+            logs/
+            briefs/
+          if-no-files-found: ignore
