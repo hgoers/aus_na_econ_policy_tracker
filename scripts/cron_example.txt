@@ -1,0 +1,7 @@
+# Weekdays at 06:30 America/New_York (example if host timezone is also ET)
+30 6 * * 1-5 cd /Users/harrietgoers/Documents/aus_na_econ_policy_tracker && /Users/harrietgoers/Documents/aus_na_econ_policy_tracker/scripts/run_pipeline.sh >> logs/cron.log 2>&1
+
+# If host timezone is not ET, use a timezone-aware scheduler (preferred):
+# - AWS EventBridge Scheduler
+# - Google Cloud Scheduler
+# - GitHub Actions with cron + timezone handling inside workflow
