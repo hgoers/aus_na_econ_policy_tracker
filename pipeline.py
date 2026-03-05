@@ -8,10 +8,10 @@ implements four tools: web_search, read_file, write_file, send_email.
 from __future__ import annotations
 
 import argparse
+import base64
 import datetime as dt
 import json
 import os
-import smtplib
 import sys
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -20,7 +20,13 @@ from typing import Any
 
 from anthropic import Anthropic
 from duckduckgo_search import DDGS
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
 from zoneinfo import ZoneInfo
+
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.send"]
 
 
 TOOL_DEFS = [
@@ -281,13 +287,58 @@ def tool_write_file(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
     return {"path": rel_path, "mode": mode, "bytes": len(content.encode("utf-8"))}
 
 
-def _smtp_bool(value: str | None, default: bool = True) -> bool:
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+def _resolve_path(root: Path, value: str) -> Path:
+    candidate = Path(value)
+    if candidate.is_absolute():
+        return candidate
+    return (root / candidate).resolve()
 
 
-def tool_send_email(payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
+def _load_gmail_credentials(root: Path) -> Credentials:
+    token_file = os.getenv("GMAIL_TOKEN_FILE", ".secrets/gmail_token.json").strip()
+    token_path = _resolve_path(root, token_file)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+
+    creds: Credentials | None = None
+    if token_path.exists():
+        creds = Credentials.from_authorized_user_file(str(token_path), GMAIL_SCOPES)
+
+    if creds and creds.expired and creds.refresh_token:
+        creds.refresh(Request())
+        token_path.write_text(creds.to_json(), encoding="utf-8")
+        return creds
+
+    if creds and creds.valid:
+        return creds
+
+    raise PipelineError(
+        f"Gmail token not valid or missing at '{token_path}'. "
+        "Run: python3 pipeline.py --init-gmail-auth"
+    )
+
+
+def initialize_gmail_auth(root: Path) -> Path:
+    credentials_file = os.getenv(
+        "GMAIL_CREDENTIALS_FILE", ".secrets/gmail_credentials.json"
+    ).strip()
+    token_file = os.getenv("GMAIL_TOKEN_FILE", ".secrets/gmail_token.json").strip()
+    creds_path = _resolve_path(root, credentials_file)
+    token_path = _resolve_path(root, token_file)
+
+    if not creds_path.exists():
+        raise PipelineError(
+            f"Gmail OAuth client file not found: '{creds_path}'. "
+            "Set GMAIL_CREDENTIALS_FILE to your Google OAuth client JSON."
+        )
+
+    flow = InstalledAppFlow.from_client_secrets_file(str(creds_path), GMAIL_SCOPES)
+    creds = flow.run_local_server(port=0)
+    token_path.parent.mkdir(parents=True, exist_ok=True)
+    token_path.write_text(creds.to_json(), encoding="utf-8")
+    return token_path
+
+
+def tool_send_email(root: Path, payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
     to_addr = str(payload.get("to", "")).strip() or os.getenv("RECIPIENT_EMAIL", "").strip()
     subject = str(payload.get("subject", "")).strip()
     body = str(payload.get("body", ""))
@@ -308,15 +359,9 @@ def tool_send_email(payload: dict[str, Any], dry_run: bool = False) -> dict[str,
             "body_preview": body[:300],
         }
 
-    from_addr = os.getenv("EMAIL_FROM", "").strip() or to_addr
-    smtp_host = os.getenv("SMTP_HOST", "").strip()
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-    smtp_user = os.getenv("SMTP_USERNAME", "").strip()
-    smtp_pass = os.getenv("SMTP_PASSWORD", "")
-    use_tls = _smtp_bool(os.getenv("SMTP_USE_TLS"), default=True)
-
-    if not smtp_host:
-        raise PipelineError("SMTP_HOST is required to send email")
+    from_addr = os.getenv("GMAIL_SENDER", "").strip() or os.getenv("EMAIL_FROM", "").strip() or to_addr
+    creds = _load_gmail_credentials(root)
+    service = build("gmail", "v1", credentials=creds, cache_discovery=False)
 
     msg = EmailMessage()
     msg["Subject"] = subject
@@ -325,13 +370,13 @@ def tool_send_email(payload: dict[str, Any], dry_run: bool = False) -> dict[str,
     if cc_addr:
         msg["Cc"] = cc_addr
     msg.set_content(body)
-
-    with smtplib.SMTP(smtp_host, smtp_port, timeout=30) as server:
-        if use_tls:
-            server.starttls()
-        if smtp_user:
-            server.login(smtp_user, smtp_pass)
-        server.send_message(msg)
+    encoded_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+    sent = (
+        service.users()
+        .messages()
+        .send(userId="me", body={"raw": encoded_message})
+        .execute()
+    )
 
     return {
         "sent": True,
@@ -339,6 +384,7 @@ def tool_send_email(payload: dict[str, Any], dry_run: bool = False) -> dict[str,
         "to": to_addr,
         "cc": cc_addr,
         "subject": subject,
+        "gmail_message_id": sent.get("id", ""),
     }
 
 
@@ -350,7 +396,7 @@ def call_tool(config: PipelineConfig, name: str, payload: dict[str, Any]) -> dic
     if name == "write_file":
         return tool_write_file(config.root, payload)
     if name == "send_email":
-        return tool_send_email(payload, dry_run=config.dry_run_email)
+        return tool_send_email(config.root, payload, dry_run=config.dry_run_email)
     raise PipelineError(f"Unknown tool requested by model: {name}")
 
 
@@ -459,6 +505,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         action="store_true",
         help="Do not send live email; return a simulated send result",
     )
+    parser.add_argument(
+        "--init-gmail-auth",
+        action="store_true",
+        help="Run interactive OAuth flow and store Gmail token JSON.",
+    )
     return parser.parse_args(argv)
 
 
@@ -480,6 +531,10 @@ def main(argv: list[str]) -> int:
     )
 
     try:
+        if args.init_gmail_auth:
+            token_path = initialize_gmail_auth(config.root)
+            print(f"Gmail token written to: {token_path}")
+            return 0
         result = run_pipeline(config)
         if result:
             print(result)

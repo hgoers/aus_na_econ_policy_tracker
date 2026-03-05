@@ -10,7 +10,12 @@ Implements the pipeline in `prompt.txt` using Anthropic tool use.
    pip install -r requirements.txt
    ```
 3. Copy `.env.example` to `.env` and fill values.
-4. Run:
+4. Add your Google OAuth client JSON at the path configured by `GMAIL_CREDENTIALS_FILE`.
+5. Run one-time Gmail auth to create the token file:
+   ```bash
+   python3 pipeline.py --init-gmail-auth
+   ```
+6. Run:
    ```bash
    ./scripts/run_pipeline.sh --dry-run-email
    ```
