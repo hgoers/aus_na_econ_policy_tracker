@@ -12,6 +12,7 @@ import base64
 import datetime as dt
 import json
 import os
+import time
 import sys
 from dataclasses import dataclass
 from email.message import EmailMessage
@@ -19,7 +20,14 @@ from pathlib import Path
 from typing import Any
 
 from anthropic import Anthropic
-from duckduckgo_search import DDGS
+try:
+    from ddgs import DDGS
+except ImportError:  # pragma: no cover
+    from duckduckgo_search import DDGS
+try:
+    import markdown as md
+except ImportError:  # pragma: no cover
+    md = None
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -53,6 +61,14 @@ TOOL_DEFS = [
                     "type": "integer",
                     "description": "Maximum number of results to return. Default 5.",
                     "default": 5,
+                },
+                "recency_hours": {
+                    "type": "integer",
+                    "description": "Optional freshness filter in hours (e.g. 24 for last day).",
+                },
+                "after_date": {
+                    "type": "string",
+                    "description": "Optional lower date bound (YYYY-MM-DD or ISO datetime).",
                 },
             },
             "required": ["query"],
@@ -140,10 +156,24 @@ class PipelineConfig:
     timezone: str
     dry_run_email: bool
     max_turns: int
+    max_web_search_calls: int
 
 
 class PipelineError(RuntimeError):
     pass
+
+
+@dataclass
+class RunState:
+    staged_writes: dict[str, str]
+    web_cache: dict[str, dict[str, Any]]
+    web_search_calls: int
+    web_search_calls_by_phase: dict[int, int]
+    phase: int
+    email_step_completed: bool
+
+
+PHASE_WEB_SEARCH_LIMITS = {1: 25, 2: 35, 3: 10, 4: 5}
 
 
 def load_dotenv(dotenv_path: Path) -> None:
@@ -205,11 +235,17 @@ def extract_system_prompt(prompt_text: str) -> str:
     if start == -1:
         raise PipelineError("Could not locate Part 1 in prompt.txt")
     part = prompt_text[start:]
+    body = part.replace(marker, "", 1).lstrip()
+    # Runtime-only prompt format: no wrapper fence at the top.
+    if not body.startswith("```"):
+        return body.strip()
+
+    # Backward-compatible legacy format: system prompt wrapped in first top-level fence.
     fence_start = part.find("```")
     fence_end = part.find("```", fence_start + 3)
-    if fence_start == -1 or fence_end == -1:
-        raise PipelineError("Could not extract fenced system prompt from prompt.txt")
-    return part[fence_start + 3 : fence_end].strip()
+    if fence_start != -1 and fence_end != -1:
+        return part[fence_start + 3 : fence_end].strip()
+    raise PipelineError("Could not extract system prompt from prompt.txt")
 
 
 def build_invocation_message(tz_name: str) -> str:
@@ -235,39 +271,168 @@ def safe_rel_path(root: Path, rel_path: str) -> Path:
     return full_path
 
 
-def tool_web_search(payload: dict[str, Any]) -> dict[str, Any]:
+def _best_effort_parse_date(value: str) -> dt.datetime | None:
+    if not value:
+        return None
+    value = value.strip()
+    formats = [
+        "%Y-%m-%d",
+        "%Y-%m-%dT%H:%M:%S",
+        "%Y-%m-%dT%H:%M:%SZ",
+        "%a, %d %b %Y %H:%M:%S %Z",
+    ]
+    for fmt in formats:
+        try:
+            parsed = dt.datetime.strptime(value, fmt)
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=dt.timezone.utc)
+            return parsed
+        except ValueError:
+            continue
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=dt.timezone.utc)
+        return parsed
+    except ValueError:
+        return None
+
+
+def _retry_with_backoff(fn: Any, attempts: int = 3, base_delay: float = 1.0) -> Any:
+    last_exc: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            return fn()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt == attempts:
+                break
+            time.sleep(base_delay * (2 ** (attempt - 1)))
+    raise PipelineError(f"Operation failed after {attempts} attempts: {last_exc}")
+
+
+def _update_phase(state: RunState, assistant_text_blocks: list[str]) -> None:
+    combined = "\n".join(assistant_text_blocks).upper()
+    if "PHASE 4" in combined:
+        state.phase = 4
+    elif "PHASE 3" in combined:
+        state.phase = 3
+    elif "PHASE 2" in combined:
+        state.phase = 2
+    elif "PHASE 1" in combined:
+        state.phase = 1
+
+
+def _filter_results_by_date(
+    results: list[dict[str, str]], recency_hours: int | None, after_date: str | None
+) -> list[dict[str, str]]:
+    if recency_hours is None and not after_date:
+        return results
+
+    cutoff: dt.datetime | None = None
+    if recency_hours is not None:
+        cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(hours=max(1, recency_hours))
+
+    after_dt = _best_effort_parse_date(after_date or "")
+    filtered: list[dict[str, str]] = []
+    for item in results:
+        published_raw = item.get("published", "")
+        published_dt = _best_effort_parse_date(published_raw)
+        if published_dt is None:
+            filtered.append(item)
+            continue
+        if cutoff and published_dt < cutoff:
+            continue
+        if after_dt and published_dt < after_dt:
+            continue
+        filtered.append(item)
+    return filtered
+
+
+def tool_web_search(config: PipelineConfig, state: RunState, payload: dict[str, Any]) -> dict[str, Any]:
     query = str(payload.get("query", "")).strip()
     if not query:
         raise PipelineError("web_search.query is required")
 
     max_results = int(payload.get("max_results", 5))
     max_results = max(1, min(max_results, 20))
+    recency_hours_raw = payload.get("recency_hours")
+    recency_hours = int(recency_hours_raw) if recency_hours_raw is not None else None
+    after_date = str(payload.get("after_date", "")).strip() or None
+    cache_key = json.dumps(
+        {
+            "q": query,
+            "n": max_results,
+            "h": recency_hours,
+            "a": after_date,
+        },
+        sort_keys=True,
+    )
+
+    if cache_key in state.web_cache:
+        cached = dict(state.web_cache[cache_key])
+        cached["cached"] = True
+        return cached
+
+    phase_limit = PHASE_WEB_SEARCH_LIMITS.get(state.phase, config.max_web_search_calls)
+    phase_count = state.web_search_calls_by_phase.get(state.phase, 0)
+    if phase_count >= phase_limit:
+        raise PipelineError(
+            f"Web search budget exceeded for phase {state.phase} (limit {phase_limit}). "
+            "Use existing findings and proceed."
+        )
+    if state.web_search_calls >= config.max_web_search_calls:
+        raise PipelineError(
+            f"Web search budget exceeded for run (limit {config.max_web_search_calls})."
+        )
 
     results: list[dict[str, str]] = []
-    with DDGS() as ddgs:
-        for hit in ddgs.text(query, max_results=max_results):
-            results.append(
-                {
-                    "title": hit.get("title", ""),
-                    "url": hit.get("href", ""),
-                    "snippet": hit.get("body", ""),
-                    "published": hit.get("date", ""),
-                }
-            )
+    def _search() -> list[dict[str, str]]:
+        tmp: list[dict[str, str]] = []
+        with DDGS() as ddgs:
+            for hit in ddgs.text(query, max_results=max_results):
+                tmp.append(
+                    {
+                        "title": hit.get("title", ""),
+                        "url": hit.get("href", ""),
+                        "snippet": hit.get("body", ""),
+                        "published": hit.get("date", ""),
+                    }
+                )
+        return tmp
 
-    return {"query": query, "count": len(results), "results": results}
+    results = _retry_with_backoff(_search, attempts=3, base_delay=1.0)
+    results = _filter_results_by_date(results, recency_hours=recency_hours, after_date=after_date)
+    state.web_search_calls += 1
+    state.web_search_calls_by_phase[state.phase] = phase_count + 1
+
+    response = {
+        "query": query,
+        "count": len(results),
+        "results": results,
+        "phase": state.phase,
+        "search_calls_used": state.web_search_calls,
+        "search_calls_limit": config.max_web_search_calls,
+        "cached": False,
+        "filters": {"recency_hours": recency_hours, "after_date": after_date},
+    }
+    state.web_cache[cache_key] = response
+    return response
 
 
-def tool_read_file(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def tool_read_file(root: Path, state: RunState, payload: dict[str, Any]) -> dict[str, Any]:
     rel_path = str(payload.get("path", "")).strip()
     target = safe_rel_path(root, rel_path)
+    staged_key = str(target)
+    if staged_key in state.staged_writes:
+        return {"path": rel_path, "exists": True, "content": state.staged_writes[staged_key], "staged": True}
     if not target.exists():
         return {"path": rel_path, "exists": False, "content": ""}
     content = target.read_text(encoding="utf-8")
-    return {"path": rel_path, "exists": True, "content": content}
+    return {"path": rel_path, "exists": True, "content": content, "staged": False}
 
 
-def tool_write_file(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
+def tool_write_file(root: Path, state: RunState, payload: dict[str, Any]) -> dict[str, Any]:
     rel_path = str(payload.get("path", "")).strip()
     content = str(payload.get("content", ""))
     mode = str(payload.get("mode", "write")).strip()
@@ -276,15 +441,22 @@ def tool_write_file(root: Path, payload: dict[str, Any]) -> dict[str, Any]:
         raise PipelineError("write_file.mode must be 'write' or 'append'")
 
     target = safe_rel_path(root, rel_path)
-    target.parent.mkdir(parents=True, exist_ok=True)
+    staged_key = str(target)
 
     if mode == "write":
-        target.write_text(content, encoding="utf-8")
+        state.staged_writes[staged_key] = content
     else:
-        with target.open("a", encoding="utf-8") as f:
-            f.write(content)
+        existing = state.staged_writes.get(staged_key)
+        if existing is None:
+            existing = target.read_text(encoding="utf-8") if target.exists() else ""
+        state.staged_writes[staged_key] = existing + content
 
-    return {"path": rel_path, "mode": mode, "bytes": len(content.encode("utf-8"))}
+    return {
+        "path": rel_path,
+        "mode": mode,
+        "bytes": len(content.encode("utf-8")),
+        "staged": True,
+    }
 
 
 def _resolve_path(root: Path, value: str) -> Path:
@@ -292,6 +464,37 @@ def _resolve_path(root: Path, value: str) -> Path:
     if candidate.is_absolute():
         return candidate
     return (root / candidate).resolve()
+
+
+def _markdown_to_html(markdown_text: str) -> str:
+    if md is not None:
+        rendered = md.markdown(
+            markdown_text,
+            extensions=["extra", "sane_lists", "nl2br"],
+        )
+    else:
+        escaped = (
+            markdown_text.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+        )
+        rendered = f"<pre>{escaped}</pre>"
+
+    return (
+        "<html><body style=\"font-family: Arial, sans-serif; line-height: 1.5;\">"
+        f"{rendered}"
+        "</body></html>"
+    )
+
+
+def _strip_email_header_lines(markdown_text: str) -> str:
+    out: list[str] = []
+    for line in markdown_text.splitlines():
+        normalized = line.strip().lower()
+        if normalized.startswith("for:") or normalized.startswith("**for**:"):
+            continue
+        out.append(line)
+    return "\n".join(out)
 
 
 def _load_gmail_credentials(root: Path) -> Credentials:
@@ -339,25 +542,28 @@ def initialize_gmail_auth(root: Path) -> Path:
 
 
 def tool_send_email(root: Path, payload: dict[str, Any], dry_run: bool = False) -> dict[str, Any]:
-    to_addr = str(payload.get("to", "")).strip() or os.getenv("RECIPIENT_EMAIL", "").strip()
+    configured_to = os.getenv("RECIPIENT_EMAIL", "").strip()
+    to_addr = configured_to
     subject = str(payload.get("subject", "")).strip()
     body = str(payload.get("body", ""))
+    email_body = _strip_email_header_lines(body)
     cc_addr = str(payload.get("cc", "")).strip() or os.getenv("CC_EMAIL", "").strip()
 
     if not to_addr:
-        raise PipelineError("Recipient missing: set RECIPIENT_EMAIL or pass 'to'.")
+        raise PipelineError("Recipient missing: set RECIPIENT_EMAIL in .env.")
     if not subject:
         raise PipelineError("Email subject is required")
 
     if dry_run:
-        return {
+        result = {
             "sent": False,
             "dry_run": True,
             "to": to_addr,
             "cc": cc_addr,
             "subject": subject,
-            "body_preview": body[:300],
+            "body_preview": email_body[:300],
         }
+        return result
 
     from_addr = os.getenv("GMAIL_SENDER", "").strip() or os.getenv("EMAIL_FROM", "").strip() or to_addr
     creds = _load_gmail_credentials(root)
@@ -369,14 +575,18 @@ def tool_send_email(root: Path, payload: dict[str, Any], dry_run: bool = False) 
     msg["To"] = to_addr
     if cc_addr:
         msg["Cc"] = cc_addr
-    msg.set_content(body)
+    msg.set_content(email_body)
+    msg.add_alternative(_markdown_to_html(email_body), subtype="html")
     encoded_message = base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
-    sent = (
-        service.users()
-        .messages()
-        .send(userId="me", body={"raw": encoded_message})
-        .execute()
-    )
+    def _send() -> dict[str, Any]:
+        return (
+            service.users()
+            .messages()
+            .send(userId="me", body={"raw": encoded_message})
+            .execute()
+        )
+
+    sent = _retry_with_backoff(_send, attempts=3, base_delay=1.0)
 
     return {
         "sent": True,
@@ -390,14 +600,38 @@ def tool_send_email(root: Path, payload: dict[str, Any], dry_run: bool = False) 
 
 def call_tool(config: PipelineConfig, name: str, payload: dict[str, Any]) -> dict[str, Any]:
     if name == "web_search":
-        return tool_web_search(payload)
+        return tool_web_search(config, config_state(), payload)
     if name == "read_file":
-        return tool_read_file(config.root, payload)
+        return tool_read_file(config.root, config_state(), payload)
     if name == "write_file":
-        return tool_write_file(config.root, payload)
+        return tool_write_file(config.root, config_state(), payload)
     if name == "send_email":
-        return tool_send_email(config.root, payload, dry_run=config.dry_run_email)
+        result = tool_send_email(config.root, payload, dry_run=config.dry_run_email)
+        config_state().email_step_completed = True
+        return result
     raise PipelineError(f"Unknown tool requested by model: {name}")
+
+
+_RUN_STATE: RunState | None = None
+
+
+def config_state() -> RunState:
+    global _RUN_STATE
+    if _RUN_STATE is None:
+        raise PipelineError("Run state is not initialized")
+    return _RUN_STATE
+
+
+def flush_staged_writes(root: Path, state: RunState) -> int:
+    written = 0
+    for path_str, content in state.staged_writes.items():
+        path = Path(path_str)
+        if root.resolve() not in path.resolve().parents and path.resolve() != root.resolve():
+            raise PipelineError(f"Staged path escaped workspace: {path}")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(content, encoding="utf-8")
+        written += 1
+    return written
 
 
 def response_to_dict(resp: Any) -> dict[str, Any]:
@@ -417,12 +651,21 @@ def append_pipeline_log(root: Path, line: str) -> None:
 
 
 def run_pipeline(config: PipelineConfig) -> str:
+    global _RUN_STATE
     load_dotenv(config.root / ".env")
     ensure_required_structure(config.root)
+    _RUN_STATE = RunState(
+        staged_writes={},
+        web_cache={},
+        web_search_calls=0,
+        web_search_calls_by_phase={1: 0, 2: 0, 3: 0, 4: 0},
+        phase=1,
+        email_step_completed=False,
+    )
 
-    api_key = os.getenv("ANTHROPIC_API_KEY", "").strip()
+    api_key = os.getenv("ANTHROPIC_API_KEY_POLICY_TRACKER", "").strip()
     if not api_key:
-        raise PipelineError("ANTHROPIC_API_KEY is not set")
+        raise PipelineError("ANTHROPIC_API_KEY_POLICY_TRACKER is not set")
 
     prompt_text = config.prompt_file.read_text(encoding="utf-8")
     system_prompt = extract_system_prompt(prompt_text)
@@ -435,12 +678,16 @@ def run_pipeline(config: PipelineConfig) -> str:
     final_text_parts: list[str] = []
 
     for turn in range(1, config.max_turns + 1):
-        response = client.messages.create(
-            model=config.model,
-            max_tokens=config.max_tokens,
-            system=system_prompt,
-            tools=TOOL_DEFS,
-            messages=messages,
+        response = _retry_with_backoff(
+            lambda: client.messages.create(
+                model=config.model,
+                max_tokens=config.max_tokens,
+                system=system_prompt,
+                tools=TOOL_DEFS,
+                messages=messages,
+            ),
+            attempts=3,
+            base_delay=1.0,
         )
 
         stamp = dt.datetime.now(dt.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
@@ -453,9 +700,17 @@ def run_pipeline(config: PipelineConfig) -> str:
         text_blocks = [block.text for block in assistant_content if getattr(block, "type", "") == "text"]
         if text_blocks:
             final_text_parts.extend(text_blocks)
+            _update_phase(config_state(), text_blocks)
 
         tool_uses = [block for block in assistant_content if getattr(block, "type", "") == "tool_use"]
         if not tool_uses:
+            state = config_state()
+            if state.staged_writes and not state.email_step_completed:
+                raise PipelineError(
+                    "Model ended without completing email step; staged file changes were not committed."
+                )
+            if state.staged_writes:
+                flush_staged_writes(config.root, state)
             runtime_s = int((dt.datetime.now(dt.timezone.utc) - started).total_seconds())
             append_pipeline_log(
                 config.root,
@@ -499,7 +754,13 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--model", default="claude-sonnet-4-20250514", help="Anthropic model")
     parser.add_argument("--max-tokens", type=int, default=16000, help="Max output tokens per API turn")
     parser.add_argument("--timezone", default="America/New_York", help="Timezone for invocation timestamp")
-    parser.add_argument("--max-turns", type=int, default=40, help="Maximum tool loop turns")
+    parser.add_argument("--max-turns", type=int, default=100, help="Maximum tool loop turns")
+    parser.add_argument(
+        "--max-web-search-calls",
+        type=int,
+        default=60,
+        help="Maximum number of web_search tool calls per run.",
+    )
     parser.add_argument(
         "--dry-run-email",
         action="store_true",
@@ -528,6 +789,7 @@ def main(argv: list[str]) -> int:
         timezone=args.timezone,
         dry_run_email=bool(args.dry_run_email),
         max_turns=args.max_turns,
+        max_web_search_calls=args.max_web_search_calls,
     )
 
     try:

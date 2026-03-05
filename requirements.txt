@@ -1,5 +1,6 @@
 anthropic>=0.39.0
-duckduckgo-search>=7.0.0
+ddgs>=8.0.0
+markdown>=3.7
 google-api-python-client>=2.170.0
 google-auth>=2.40.0
 google-auth-httplib2>=0.2.0
