@@ -61,16 +61,47 @@ jobs:
           CC_EMAIL: ${{ secrets.CC_EMAIL }}
           GMAIL_CREDENTIALS_JSON_B64: ${{ secrets.GMAIL_CREDENTIALS_JSON_B64 }}
           GMAIL_TOKEN_JSON_B64: ${{ secrets.GMAIL_TOKEN_JSON_B64 }}
+          # Backward-compatible fallbacks (legacy/misnamed secrets)
+          GMAIL_CREDENTIALS_FILE: ${{ secrets.GMAIL_CREDENTIALS_FILE }}
+          GMAIL_TOKEN_FILE: ${{ secrets.GMAIL_TOKEN_FILE }}
           GMAIL_SENDER: ${{ secrets.GMAIL_SENDER }}
           EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
         run: |
           mkdir -p .secrets
 
-          if [[ -n "${GMAIL_CREDENTIALS_JSON_B64}" ]]; then
-            echo "$GMAIL_CREDENTIALS_JSON_B64" | base64 -d > .secrets/gmail_credentials.json
+          CRED_B64="${GMAIL_CREDENTIALS_JSON_B64}"
+          TOKEN_B64="${GMAIL_TOKEN_JSON_B64}"
+          if [[ -z "${CRED_B64}" && -n "${GMAIL_CREDENTIALS_FILE}" ]]; then
+            CRED_B64="${GMAIL_CREDENTIALS_FILE}"
           fi
-          if [[ -n "${GMAIL_TOKEN_JSON_B64}" ]]; then
-            echo "$GMAIL_TOKEN_JSON_B64" | base64 -d > .secrets/gmail_token.json
+          if [[ -z "${TOKEN_B64}" && -n "${GMAIL_TOKEN_FILE}" ]]; then
+            TOKEN_B64="${GMAIL_TOKEN_FILE}"
+          fi
+
+          if [[ -z "${ANTHROPIC_API_KEY_POLICY_TRACKER}" ]]; then
+            echo "Missing required secret: ANTHROPIC_API_KEY_POLICY_TRACKER" >&2
+            exit 1
+          fi
+          if [[ -z "${RECIPIENT_EMAIL}" ]]; then
+            echo "Missing required secret: RECIPIENT_EMAIL" >&2
+            exit 1
+          fi
+          if [[ -z "${CRED_B64}" ]]; then
+            echo "Missing required secret: GMAIL_CREDENTIALS_JSON_B64 (or fallback GMAIL_CREDENTIALS_FILE)" >&2
+            exit 1
+          fi
+          if [[ -z "${TOKEN_B64}" ]]; then
+            echo "Missing required secret: GMAIL_TOKEN_JSON_B64 (or fallback GMAIL_TOKEN_FILE)" >&2
+            exit 1
+          fi
+
+          if ! echo "${CRED_B64}" | base64 -d > .secrets/gmail_credentials.json; then
+            echo "Could not decode Gmail credentials secret as base64 JSON." >&2
+            exit 1
+          fi
+          if ! echo "${TOKEN_B64}" | base64 -d > .secrets/gmail_token.json; then
+            echo "Could not decode Gmail token secret as base64 JSON." >&2
+            exit 1
           fi
 
           {

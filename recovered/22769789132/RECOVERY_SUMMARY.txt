@@ -1,0 +1,6 @@
+Recovered staged writes from failed run 22769789132
+
+1. ./briefs/BRIEF-2026-003.md (write) from response_20260306T152549Z_turn23.json len=3703
+2. ./briefs/brief_index.md (write) from response_20260306T152600Z_turn24.json len=361
+3. ./logs/running_notes.md (write) from response_20260306T152615Z_turn25.json len=2107
+4. ./logs/pipeline_log.md (write) from response_20260306T152635Z_turn28.json len=639
