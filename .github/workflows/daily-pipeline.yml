@@ -22,7 +22,16 @@ jobs:
       - name: Gate to 06:00 New York time
         id: ny_gate
         shell: bash
+        env:
+          EVENT_NAME: ${{ github.event_name }}
         run: |
+          if [[ "$EVENT_NAME" == "workflow_dispatch" ]]; then
+            echo "run=true" >> "$GITHUB_OUTPUT"
+            echo "NY time: $(TZ=America/New_York date '+%Y-%m-%d %H:%M:%S %Z')"
+            echo "Manual dispatch detected; bypassing time gate."
+            exit 0
+          fi
+
           NY_HOUR=$(TZ=America/New_York date +%H)
           # GitHub scheduled jobs are not guaranteed to start exactly on the minute.
           # Run if the current New York hour is 06, regardless of minute.
