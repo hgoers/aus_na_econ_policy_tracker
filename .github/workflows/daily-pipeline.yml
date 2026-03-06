@@ -24,8 +24,9 @@ jobs:
         shell: bash
         run: |
           NY_HOUR=$(TZ=America/New_York date +%H)
-          NY_MIN=$(TZ=America/New_York date +%M)
-          if [[ "$NY_HOUR" == "06" && "$NY_MIN" == "00" ]]; then
+          # GitHub scheduled jobs are not guaranteed to start exactly on the minute.
+          # Run if the current New York hour is 06, regardless of minute.
+          if [[ "$NY_HOUR" == "06" ]]; then
             echo "run=true" >> "$GITHUB_OUTPUT"
           else
             echo "run=false" >> "$GITHUB_OUTPUT"
