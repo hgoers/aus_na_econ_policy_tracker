@@ -93,8 +93,8 @@ CC_EMAIL=
   ```bash
   python3 pipeline.py --init-gmail-auth
   ```
-- Schedule weekday runs at 06:30 ET:
-  - See `scripts/cron_example.txt` (timezone-aware scheduler preferred).
+- Local machine scheduling example:
+  - See `scripts/cron_example.txt` (cloud scheduler/GitHub Actions preferred).
 
 ## GitHub Actions automation (computer can be off)
 
@@ -102,6 +102,7 @@ Workflow file: [`.github/workflows/daily-pipeline.yml`](/Users/harrietgoers/Docu
 
 - Runs daily (including weekends) at **06:00 America/New_York** (DST-safe via dual UTC cron + NY-time gate).
 - Supports manual trigger via `workflow_dispatch`.
+- Manual `workflow_dispatch` bypasses the 06:00 time gate and runs immediately.
 - Executes live pipeline run and uploads `logs/` + `briefs/` artifacts.
 
 Required repository secrets:
@@ -109,6 +110,10 @@ Required repository secrets:
 - `RECIPIENT_EMAIL`
 - `GMAIL_CREDENTIALS_JSON_B64` (base64 of `gmail_credentials.json`)
 - `GMAIL_TOKEN_JSON_B64` (base64 of `gmail_token.json`)
+
+Accepted fallback secret names (legacy compatibility):
+- `GMAIL_CREDENTIALS_FILE` (treated as base64 credentials JSON content)
+- `GMAIL_TOKEN_FILE` (treated as base64 token JSON content)
 
 Optional repository secrets:
 - `CC_EMAIL`
@@ -127,10 +132,11 @@ base64 -i .secrets/gmail_token.json | pbcopy
 - Email recipient is enforced from `.env` (`RECIPIENT_EMAIL`), not model-provided `to`.
 - Outgoing email strips the `For:` line and sends formatted HTML plus plain text.
 - If a run fails, check `logs/pipeline_log.md` first, then inspect `logs/api_archive/`.
+- On GitHub Actions, missing/invalid Gmail secrets fail fast in the `Materialize credentials and env` step with explicit error messages.
 
 ## Expected daily output example
 
-Example sequence from a successful weekday run:
+Example sequence from a successful daily run:
 
 1. Brief file written:
    - `briefs/BRIEF-2026-003.md`
