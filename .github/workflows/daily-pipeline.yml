@@ -2,12 +2,6 @@ name: Daily Economic Intelligence Pipeline
 
 on:
   workflow_dispatch:
-  schedule:
-    # 06:00 America/New_York daily (including weekends), with DST handling:
-    # - 10:00 UTC covers EDT
-    # - 11:00 UTC covers EST
-    - cron: '0 10 * * *'
-    - cron: '0 11 * * *'
 
 jobs:
   run-pipeline:
